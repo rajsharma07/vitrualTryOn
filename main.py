@@ -1,193 +1,277 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-import json
-import math
+from pathlib import Path
 
 # -------------------------------
-# Load shirt and anchors
-# -------------------------------
-shirt = cv2.imread(
-    "DataSet/processed_clothes/shirt_01.png",
-    cv2.IMREAD_UNCHANGED
-)
-
-if shirt is None:
-    raise RuntimeError("Shirt image not found")
-
-if shirt.shape[2] != 4:
-    raise RuntimeError("Shirt must be a PNG with alpha channel")
-
-with open("DataSet/anchors/shirt_01.json") as f:
-    anchors = json.load(f)
-
-cloth_ls = np.array(anchors["left_shoulder"], dtype=np.float32)
-cloth_rs = np.array(anchors["right_shoulder"], dtype=np.float32)
-cloth_bottom = np.array(anchors["bottom"], dtype=np.float32)
-
-cloth_width = np.linalg.norm(cloth_rs - cloth_ls)
-cloth_mid = (cloth_ls + cloth_rs) / 2
-
-# -------------------------------
-# MediaPipe Pose
+# MediaPipe Pose & Segmentation
 # -------------------------------
 mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+mp_seg = mp.solutions.selfie_segmentation
+mp_draw = mp.solutions.drawing_utils
 
+pose = mp_pose.Pose(static_image_mode=True)
+segmenter = mp_seg.SelfieSegmentation(model_selection=1)
+
+
+
+
+
+# Helper to display resized images
+def show_resized(win_name, img, max_w=900, max_h=700):
+    if img is None:
+        return
+    h, w = img.shape[:2]
+    scale = min(max_w / w, max_h / h, 1.0)
+    if scale < 1.0:
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    cv2.imshow(win_name, img)
+def detect_torso(image, binary_mask, pose_result, margin=0.25, min_vis=0.5):
+    h, w = image.shape[:2]
+    lm = pose_result.pose_landmarks.landmark
+
+    def lm_safe(lm):
+        if lm.visibility < min_vis:
+            return None
+        return int(lm.x * w), int(lm.y * h)
+
+    ids = [
+        mp_pose.PoseLandmark.LEFT_SHOULDER,
+        mp_pose.PoseLandmark.RIGHT_SHOULDER,
+        mp_pose.PoseLandmark.LEFT_HIP,
+        mp_pose.PoseLandmark.RIGHT_HIP
+    ]
+
+    pts = [lm_safe(lm[i.value]) for i in ids]
+    pts = [p for p in pts if p]
+
+    if len(pts) < 3:
+        return None, None
+
+    xs, ys = zip(*pts)
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+
+    box_w = x_max - x_min
+    box_h = y_max - y_min
+
+    x1 = max(int(x_min - box_w * margin), 0)
+    x2 = min(int(x_max + box_w * margin), w)
+    y1 = max(int(y_min - box_h * 0.35), 0)
+    y2 = min(int(y_max + box_h * 0.15), h)
+
+    torso_mask = binary_mask[y1:y2, x1:x2]
+    torso = image[y1:y2, x1:x2] * torso_mask[:, :, None]
+
+    return (x1, y1, x2, y2), torso
+
+#---------------------------------
+def recommend_shirt_size(pose_result, img_w, img_h):
+    lm = pose_result.pose_landmarks.landmark
+
+    def pt(idx):
+        return np.array([
+            lm[idx].x * img_w,
+            lm[idx].y * img_h
+        ])
+
+    # Key landmarks
+    LS = pt(mp_pose.PoseLandmark.LEFT_SHOULDER)
+    RS = pt(mp_pose.PoseLandmark.RIGHT_SHOULDER)
+    LH = pt(mp_pose.PoseLandmark.LEFT_HIP)
+    RH = pt(mp_pose.PoseLandmark.RIGHT_HIP)
+
+    # Measurements (pixels)
+    shoulder_width = np.linalg.norm(LS - RS)
+    shoulder_center = (LS + RS) / 2
+    hip_center = (LH + RH) / 2
+    torso_length = np.linalg.norm(shoulder_center - hip_center)
+
+    hip_width = np.linalg.norm(LH - RH)
+
+    # ----------------------------
+    # Normalized ratios
+    # ----------------------------
+    torso_ratio = torso_length / shoulder_width
+    hip_ratio = hip_width / shoulder_width
+
+    # ----------------------------
+    # Size classification (MEN – TSHIRT)
+    # ----------------------------
+    if shoulder_width < 140:
+        size = "S"
+    elif shoulder_width < 170:
+        size = "M"
+    elif shoulder_width < 200:
+        size = "L"
+    else:
+        size = "XL"
+
+    # Fit type (bonus)
+    if torso_ratio < 1.25:
+        fit = "Short Torso"
+    elif torso_ratio > 1.5:
+        fit = "Long Torso"
+    else:
+        fit = "Regular Fit"
+
+    return {
+        "size": size,
+        "shoulder_px": int(shoulder_width),
+        "torso_px": int(torso_length),
+        "torso_ratio": round(torso_ratio, 2),
+        "fit": fit
+    }
+
+
+# Load shirt image
+cloth = None
+base = Path(__file__).resolve().parent
+candidates = [base / "tshirt.png", base / "pictures" / "tshirt.png", Path("tshirt.png"), Path("pictures") / "tshirt.png"]
+found_path = None
+for p in candidates:
+    if p.exists():
+        img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+        if img is not None:
+            cloth = img
+            found_path = p
+            break
+
+if cloth is None:
+    raise FileNotFoundError(f"tshirt.png not found. Tried: {[str(p) for p in candidates]}")
+
+if cloth.ndim == 2:
+    cloth = cv2.cvtColor(cloth, cv2.COLOR_GRAY2BGRA)
+elif cloth.shape[2] == 3:
+    b, g, r = cv2.split(cloth)
+    alpha = np.full(b.shape, 255, dtype=b.dtype)
+    cloth = cv2.merge([b, g, r, alpha])
+elif cloth.shape[2] != 4:
+    raise ValueError("tshirt.png must have 1, 3 or 4 channels")
+
+
+# Start video capture
 cap = cv2.VideoCapture(0)
 
-# -------------------------------
-# Overlay helper
-# -------------------------------
-def overlay_transparent(bg, overlay, x, y):
-    bg_h, bg_w = bg.shape[:2]
-    h, w = overlay.shape[:2]
-
-    x1, y1 = max(x, 0), max(y, 0)
-    x2, y2 = min(x + w, bg_w), min(y + h, bg_h)
-
-    if x1 >= x2 or y1 >= y2:
-        return bg
-
-    ox1, oy1 = x1 - x, y1 - y
-    ox2, oy2 = ox1 + (x2 - x1), oy1 + (y2 - y1)
-
-    crop = overlay[oy1:oy2, ox1:ox2]
-    alpha = crop[:, :, 3] / 255.0
-    alpha = alpha[:, :, None]
-
-    bg[y1:y2, x1:x2] = (
-        alpha * crop[:, :, :3] +
-        (1 - alpha) * bg[y1:y2, x1:x2]
-    ).astype(np.uint8)
-
-    return bg
-
-# -------------------------------
-# Geometry helpers
-# -------------------------------
-def rotate_point(pt, center, angle_deg):
-    angle = math.radians(angle_deg)
-    ox, oy = center
-    px, py = pt
-
-    qx = ox + math.cos(angle) * (px - ox) - math.sin(angle) * (py - oy)
-    qy = oy + math.sin(angle) * (px - ox) + math.cos(angle) * (py - oy)
-    return np.array([qx, qy])
-
-# -------------------------------
-# Smoothing
-# -------------------------------
-prev_x = prev_y = prev_angle = prev_scale = None
-smooth_alpha = 0.8
-
-# -------------------------------
-# Main loop
-# -------------------------------
 while True:
     ret, frame = cap.read()
     if not ret:
         break
 
     frame = cv2.flip(frame, 1)
+    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) 
+    img_h, img_w = frame.shape[:2]
+    
+    pose_result = pose.process(image_rgb)
+    seg_result = segmenter.process(image_rgb)
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = pose.process(rgb)
+    if not pose_result.pose_landmarks:
+        cv2.putText(frame, "No pose detected", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        show_resized("Virtual Try-On", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        continue
 
-    if results.pose_landmarks:
-        lm = results.pose_landmarks.landmark
-        h, w, _ = frame.shape
+    binary_mask = (seg_result.segmentation_mask > 0.5).astype(np.uint8)
 
-        l_px = np.array([
-            lm[mp_pose.PoseLandmark.LEFT_SHOULDER].x * w,
-            lm[mp_pose.PoseLandmark.LEFT_SHOULDER].y * h
-        ])
-        r_px = np.array([
-            lm[mp_pose.PoseLandmark.RIGHT_SHOULDER].x * w,
-            lm[mp_pose.PoseLandmark.RIGHT_SHOULDER].y * h
-        ])
+    annotated = frame.copy()
+    mp_draw.draw_landmarks(
+        annotated,
+        pose_result.pose_landmarks,
+        mp_pose.POSE_CONNECTIONS
+    )
 
-        user_mid = (l_px + r_px) / 2
+    bbox, torso = detect_torso(frame, binary_mask, pose_result)
 
-        # -------------------------------
-        # Scale (smoothed)
-        # -------------------------------
-        scale = np.linalg.norm(r_px - l_px) / cloth_width
-        scale = np.clip(scale, 0.6, 1.8)
+    if bbox is not None:
+        cloth_rgb = cloth[:, :, :3]
+        cloth_alpha = cloth[:, :, 3] / 255.0
 
-        if prev_scale is None:
-            scale_s = scale
-        else:
-            scale_s = smooth_alpha * prev_scale + (1 - smooth_alpha) * scale
-        prev_scale = scale_s
-        scale = scale_s
+        lm = pose_result.pose_landmarks.landmark
 
-        new_w = int(shirt.shape[1] * scale)
-        new_h = int(shirt.shape[0] * scale)
+        l_sh = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
+        r_sh = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
 
-        shirt_resized = cv2.resize(shirt, (new_w, new_h))
+        if l_sh.visibility >= 0.6 and r_sh.visibility >= 0.6:
+            lx, ly = int(l_sh.x * img_w), int(l_sh.y * img_h)
+            rx, ry = int(r_sh.x * img_w), int(r_sh.y * img_h)
 
-        # -------------------------------
-        # Rotation (clamped + smoothed)
-        # -------------------------------
-        dx = r_px[0] - l_px[0]
-        dy = l_px[1] - r_px[1]
-        angle = math.degrees(math.atan2(dy, dx))
-        angle = np.clip(angle, -25, 25)
+            shoulder_width = abs(rx - lx)
 
-        if prev_angle is None:
-            angle_s = angle
-        else:
-            angle_s = smooth_alpha * prev_angle + (1 - smooth_alpha) * angle
-        prev_angle = angle_s
+            scale_factor = 1.75
+            target_w = int(shoulder_width * scale_factor)
+            aspect = cloth_rgb.shape[0] / cloth_rgb.shape[1]
+            target_h = int(target_w * aspect)
 
-        img_center = np.array([new_w / 2, new_h / 2])
+            cloth_rgb_resized = cv2.resize(cloth_rgb, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            cloth_alpha_resized = cv2.resize(cloth_alpha, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
-        M = cv2.getRotationMatrix2D(tuple(img_center), angle_s, 1.0)
-        shirt_rotated = cv2.warpAffine(
-            shirt_resized,
-            M,
-            (new_w, new_h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0, 0)
-        )
+            x_center = (lx + rx) // 2
+            y_top = min(ly, ry) - int(0.17 * target_h)
 
-        # -------------------------------
-        # Correct anchor positioning
-        # -------------------------------
-        cloth_mid_scaled = cloth_mid * scale
-        cloth_bottom_scaled = cloth_bottom * scale
+            x1 = x_center - target_w // 2
+            y1 = y_top
+            x2 = x1 + target_w
+            y2 = y1 + target_h
 
-        rotated_mid = rotate_point(
-            cloth_mid_scaled,
-            img_center,
-            angle_s
-        )
+            if x1 < 0:
+                cloth_rgb_resized = cloth_rgb_resized[:, -x1:]
+                cloth_alpha_resized = cloth_alpha_resized[:, -x1:]
+                x1 = 0
 
-        shirt_drop = cloth_bottom_scaled[1] - cloth_mid_scaled[1]
+            if y1 < 0:
+                cloth_rgb_resized = cloth_rgb_resized[-y1:, :]
+                cloth_alpha_resized = cloth_alpha_resized[-y1:, :]
+                y1 = 0
 
-        raw_x = user_mid[0] - rotated_mid[0]
-        raw_y = user_mid[1] - rotated_mid[1] + 0.08 * shirt_drop
+            x2 = min(x1 + cloth_rgb_resized.shape[1], img_w)
+            y2 = min(y1 + cloth_rgb_resized.shape[0], img_h)
 
-        if prev_x is None:
-            x, y = raw_x, raw_y
-        else:
-            x = smooth_alpha * prev_x + (1 - smooth_alpha) * raw_x
-            y = smooth_alpha * prev_y + (1 - smooth_alpha) * raw_y
+            cloth_rgb_resized = cloth_rgb_resized[:y2 - y1, :x2 - x1]
+            cloth_alpha_resized = cloth_alpha_resized[:y2 - y1, :x2 - x1]
 
-        prev_x, prev_y = x, y
-        x, y = int(x), int(y)
+            torso_mask_full = np.zeros((img_h, img_w), dtype=np.uint8)
+            tx1, ty1, tx2, ty2 = bbox
+            torso_mask_full[ty1:ty2, tx1:tx2] = binary_mask[ty1:ty2, tx1:tx2]
 
-        frame = overlay_transparent(frame, shirt_rotated, x, y)
+            roi = annotated[y1:y2, x1:x2]
+            roi_mask = torso_mask_full[y1:y2, x1:x2]
 
-    cv2.imshow("Virtual Try-On", frame)
-    if cv2.waitKey(1) & 0xFF == 27:
+            for c in range(3):
+                roi[:, :, c] = (
+                    roi_mask * (
+                        cloth_alpha_resized * cloth_rgb_resized[:, :, c] +
+                        (1 - cloth_alpha_resized) * roi[:, :, c]
+                    ) +
+                    (1 - roi_mask) * roi[:, :, c]
+                )
+
+            annotated[y1:y2, x1:x2] = roi
+
+    # Get body info for display
+    body_info = recommend_shirt_size(pose_result, img_w, img_h)
+
+    # Display size and fit information on frame
+    label = f"Size: {body_info['size']} | Fit: {body_info['fit']}"
+    info_text = f"Shoulders: {body_info['shoulder_px']}px | Torso: {body_info['torso_px']}px"
+    ratio_text = f"Torso Ratio: {body_info['torso_ratio']}"
+
+    # Background box for text
+    cv2.rectangle(annotated, (10, 10), (600, 110), (0, 0, 0), -1)
+    
+    # Display text
+    cv2.putText(annotated, label, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(annotated, info_text, (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 1, cv2.LINE_AA)
+    cv2.putText(annotated, ratio_text, (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 1, cv2.LINE_AA)
+
+    # Display frame
+    show_resized("Virtual Try-On", annotated)
+
+    # Press 'q' to exit
+    if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 cap.release()
 cv2.destroyAllWindows()
 pose.close()
+segmenter.close()
